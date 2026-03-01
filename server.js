@@ -1,64 +1,102 @@
-import express from "express";
-import dotenv from "dotenv";
-import OpenAI from "openai";
-import cors from "cors";
+// server.js
+const express = require("express");
+const cors = require("cors");
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
 
-dotenv.config();
+const OpenAI = require("openai");
 
+// ---------- App Setup ----------
 const app = express();
 
-/**
- * ✅ Bulletproof CORS + Preflight (OPTIONS) handling
- * Must be BEFORE routes.
- */
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
+// CORS (adjust origin if you want to lock it down)
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+// Preflight
+app.options("*", cors());
+
+// JSON body parsing for non-multipart routes
+app.use(express.json({ limit: "2mb" }));
+
+// ---------- OpenAI ----------
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// ---------- Uploads (Multer) ----------
+const uploadDir = path.join(__dirname, "uploads");
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadDir),
+  filename: (req, file, cb) => {
+    const safeName = Date.now() + "-" + file.originalname.replace(/\s+/g, "_");
+    cb(null, safeName);
+  },
 });
 
-// Optional: cors package (fine to keep)
-app.use(cors());
-
-app.use(express.json());
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+const upload = multer({
+  storage,
+  limits: { fileSize: 200 * 1024 * 1024 }, // 200MB
 });
 
-app.get("/", (req, res) => {
-  res.json({ ok: true });
-});
-
-/**
- * ✅ Use this to confirm Render is running the updated code
- */
+// ---------- Routes ----------
 app.get("/version", (req, res) => {
-  res.json({ version: "cors-fix-1" });
+  res.json({ ok: true, version: "phase1-upload-v1" });
 });
 
 app.post("/ask", async (req, res) => {
   try {
-    const userMessage = req.body?.message || "";
+    const userMessage = req.body?.message || req.body?.input || req.body?.userMessage;
+
+    if (!userMessage) {
+      return res.status(400).json({ error: "Missing message in request body" });
+    }
 
     const response = await openai.responses.create({
       model: "gpt-4o-mini",
       input: userMessage,
     });
 
-    res.json({ reply: response.output_text });
-  } catch (error) {
-    console.error("ASK ERROR:", error);
-    res.status(500).json({ error: "Something went wrong" });
+    // Safely extract text output
+    const reply =
+      response.output_text ||
+      (response.output?.[0]?.content?.[0]?.text ?? "No response text returned.");
+
+    res.json({ reply });
+  } catch (err) {
+    console.error("Error in /ask:", err);
+    res.status(500).json({ error: "Server error in /ask" });
   }
 });
 
-/**
- * ✅ Render requires using process.env.PORT
- */
-const PORT = process.env.PORT || 3001;
+// Upload endpoint: expects multipart/form-data with field name "video"
+app.post("/upload", upload.single("video"), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ ok: false, error: "No file uploaded" });
+    }
+
+    res.json({
+      ok: true,
+      filename: req.file.filename,
+      originalname: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+    });
+  } catch (err) {
+    console.error("Error in /upload:", err);
+    res.status(500).json({ ok: false, error: "Server error in /upload" });
+  }
+});
+
+// ---------- Start Server ----------
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
