@@ -20,7 +20,7 @@ app.use(
 );
 
 // Preflight
-app.options("*", cors());
+app.options(/.*/, cors());
 
 // JSON body parsing for non-multipart routes
 app.use(express.json({ limit: "2mb" }));
