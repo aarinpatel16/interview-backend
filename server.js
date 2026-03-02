@@ -48,24 +48,106 @@ const upload = multer({
 
 // ---------- Helpers ----------
 function safeUploadPath(filename) {
-  // Disallow path traversal and weird inputs
   if (!filename || typeof filename !== "string") return null;
   if (filename.includes("..") || filename.includes("/") || filename.includes("\\")) return null;
   return path.join(uploadDir, filename);
 }
 
+function normalizeText(s) {
+  return (s || "").replace(/\s+/g, " ").trim();
+}
+
+function countWords(text) {
+  const t = normalizeText(text);
+  if (!t) return 0;
+  return t.split(" ").filter(Boolean).length;
+}
+
+function countFillerWords(text) {
+  const t = (text || "").toLowerCase();
+
+  const fillers = [
+    "um",
+    "uh",
+    "like",
+    "you know",
+    "kind of",
+    "sort of",
+    "actually",
+    "basically",
+    "literally",
+    "i mean",
+    "right",
+  ];
+
+  const counts = {};
+  let total = 0;
+
+  for (const f of fillers) {
+    const re = new RegExp(`\\b${f.replace(/\s+/g, "\\s+")}\\b`, "g");
+    const m = t.match(re);
+    const c = m ? m.length : 0;
+    counts[f] = c;
+    total += c;
+  }
+
+  return { total, counts };
+}
+
+function sentenceStats(text) {
+  const t = normalizeText(text);
+  if (!t) return { sentences: 0, avgWordsPerSentence: 0 };
+
+  const sentences = t
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (sentences.length === 0) return { sentences: 0, avgWordsPerSentence: 0 };
+
+  const wordsPerSentence = sentences.map((s) => countWords(s));
+  const avgWordsPerSentence =
+    wordsPerSentence.reduce((a, b) => a + b, 0) / sentences.length;
+
+  return {
+    sentences: sentences.length,
+    avgWordsPerSentence: Math.round(avgWordsPerSentence * 10) / 10,
+  };
+}
+
+function computeMetrics(transcript) {
+  const words = countWords(transcript);
+  const filler = countFillerWords(transcript);
+  const s = sentenceStats(transcript);
+
+  const hasStructureSignals = /first|second|third|overall|in conclusion|to summarize|because|for example/i.test(
+    transcript || ""
+  );
+
+  const questionHandlingSignals = /that's a great question|i would say|in my experience|one example/i.test(
+    transcript || ""
+  );
+
+  return {
+    words,
+    sentences: s.sentences,
+    avgWordsPerSentence: s.avgWordsPerSentence,
+    fillerTotal: filler.total,
+    fillerBreakdown: filler.counts,
+    structureSignals: hasStructureSignals,
+    responseSignals: questionHandlingSignals,
+  };
+}
+
 // ---------- Routes ----------
 app.get("/version", (req, res) => {
-  res.json({ ok: true, version: "phase2-transcribe-v1" });
+  res.json({ ok: true, version: "phase3-score-v1" });
 });
 
 app.post("/ask", async (req, res) => {
   try {
     const userMessage = req.body?.message || req.body?.input || req.body?.userMessage;
-
-    if (!userMessage) {
-      return res.status(400).json({ error: "Missing message in request body" });
-    }
+    if (!userMessage) return res.status(400).json({ error: "Missing message in request body" });
 
     const response = await openai.responses.create({
       model: "gpt-4o-mini",
@@ -74,7 +156,8 @@ app.post("/ask", async (req, res) => {
 
     const reply =
       response.output_text ||
-      (response.output?.[0]?.content?.[0]?.text ?? "No response text returned.");
+      response.output?.[0]?.content?.[0]?.text ||
+      "No response text returned.";
 
     res.json({ reply });
   } catch (err) {
@@ -83,12 +166,10 @@ app.post("/ask", async (req, res) => {
   }
 });
 
-// Upload endpoint: expects multipart/form-data with field name "video"
+// Upload endpoint: multipart/form-data with field name "video"
 app.post("/upload", upload.single("video"), (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ ok: false, error: "No file uploaded" });
-    }
+    if (!req.file) return res.status(400).json({ ok: false, error: "No file uploaded" });
 
     res.json({
       ok: true,
@@ -103,43 +184,112 @@ app.post("/upload", upload.single("video"), (req, res) => {
   }
 });
 
-/**
- * Transcribe endpoint:
- * Body: { filename: "12345-interview.webm" }
- * Returns: { ok: true, text: "..." }
- */
+// Transcribe endpoint: { filename }
 app.post("/transcribe", async (req, res) => {
   try {
     const filename = req.body?.filename;
     const filePath = safeUploadPath(filename);
 
-    if (!filePath) {
-      return res.status(400).json({ ok: false, error: "Invalid filename" });
-    }
+    if (!filePath) return res.status(400).json({ ok: false, error: "Invalid filename" });
+    if (!fs.existsSync(filePath)) return res.status(404).json({ ok: false, error: "File not found" });
 
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ ok: false, error: "File not found" });
-    }
-
-    // Whisper can transcribe webm directly (no ffmpeg needed)
     const transcript = await openai.audio.transcriptions.create({
       model: "whisper-1",
       file: fs.createReadStream(filePath),
-      // Optional:
-      // response_format: "json",
-      // language: "en",
     });
 
-    // The SDK returns an object with .text
     res.json({ ok: true, text: transcript.text, filename });
   } catch (err) {
     console.error("Error in /transcribe:", err);
-    res.status(500).json({ ok: false, error: "Server error in /transcribe" });
+    const message = err?.message || "Unknown error";
+    const status = err?.status || err?.response?.status;
+    const details = err?.response?.data || err?.error || null;
+
+    res.status(500).json({
+      ok: false,
+      error: "Server error in /transcribe",
+      message,
+      status,
+      details,
+    });
+  }
+});
+
+// Score endpoint: { transcript, role?, level? }
+app.post("/score", async (req, res) => {
+  try {
+    const transcriptRaw = req.body?.transcript;
+    const role = req.body?.role || "college admissions interview";
+    const level = req.body?.level || "high school applicant";
+
+    const transcript = normalizeText(transcriptRaw);
+    if (!transcript) return res.status(400).json({ ok: false, error: "Missing transcript" });
+
+    const metrics = computeMetrics(transcript);
+
+    const prompt = `
+You are an interview coach scoring a response for: ${role}.
+Candidate level: ${level}.
+
+Score this transcript using a rubric with clear, actionable feedback.
+Return ONLY valid JSON matching the schema.
+
+Transcript:
+"""${transcript}"""
+`.trim();
+
+    const response = await openai.responses.create({
+      model: "gpt-4o-mini",
+      input: prompt,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "InterviewScore",
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              overallScore: { type: "integer", minimum: 1, maximum: 10 },
+              categoryScores: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  content: { type: "integer", minimum: 1, maximum: 10 },
+                  structure: { type: "integer", minimum: 1, maximum: 10 },
+                  clarity: { type: "integer", minimum: 1, maximum: 10 },
+                  confidence: { type: "integer", minimum: 1, maximum: 10 },
+                },
+                required: ["content", "structure", "clarity", "confidence"],
+              },
+              strengths: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 6 },
+              improvements: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 8 },
+              rewriteSuggestion: { type: "string" },
+              followUpQuestions: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 6 },
+            },
+            required: ["overallScore", "categoryScores", "strengths", "improvements", "rewriteSuggestion", "followUpQuestions"],
+          },
+        },
+      },
+    });
+
+    let ai;
+    try {
+      ai = JSON.parse(response.output_text || "{}");
+    } catch {
+      ai = null;
+    }
+
+    if (!ai) {
+      return res.status(500).json({ ok: false, error: "AI returned invalid JSON" });
+    }
+
+    res.json({ ok: true, metrics, ai });
+  } catch (err) {
+    console.error("Error in /score:", err);
+    res.status(500).json({ ok: false, error: "Server error in /score" });
   }
 });
 
 // ---------- Start Server ----------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
