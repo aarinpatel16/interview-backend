@@ -31,12 +31,12 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ---------- Uploads (Multer) ----------
 const uploadDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadDir),
   filename: (req, file, cb) => {
-    const safeName = Date.now() + "-" + file.originalname.replace(/\s+/g, "_");
+    const safeName = Date.now() + "-" + String(file.originalname || "interview.webm").replace(/\s+/g, "_");
     cb(null, safeName);
   },
 });
@@ -141,7 +141,7 @@ function computeMetrics(transcript) {
 
 // ---------- Routes ----------
 app.get("/version", (req, res) => {
-  res.json({ ok: true, version: "phase4-live-interview-v1" });
+  res.json({ ok: true, version: "phase4-live-interview-v2-final-report" });
 });
 
 app.post("/ask", async (req, res) => {
@@ -266,7 +266,14 @@ Transcript:
               rewriteSuggestion: { type: "string" },
               followUpQuestions: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 6 },
             },
-            required: ["overallScore", "categoryScores", "strengths", "improvements", "rewriteSuggestion", "followUpQuestions"],
+            required: [
+              "overallScore",
+              "categoryScores",
+              "strengths",
+              "improvements",
+              "rewriteSuggestion",
+              "followUpQuestions",
+            ],
           },
         },
       },
@@ -350,6 +357,102 @@ Return ONLY valid JSON:
   } catch (err) {
     console.error("Error in /next-question:", err);
     res.status(500).json({ ok: false, error: "Server error in /next-question" });
+  }
+});
+
+// ✅ Final report endpoint: { turns, style, difficulty }
+app.post("/final-report", async (req, res) => {
+  try {
+    const turns = Array.isArray(req.body?.turns) ? req.body.turns : [];
+    const style = req.body?.style || "mixed";
+    const difficulty = req.body?.difficulty || "medium";
+
+    if (turns.length === 0) {
+      return res.json({
+        ok: true,
+        report: {
+          overallAssessment:
+            "No answers were recorded in this session, so there isn’t enough information to generate a final report yet.",
+          topStrengths: [],
+          topWeaknesses: [],
+          improvementPlan: [],
+          standoutMoments: [],
+          nextPracticeQuestions: [],
+        },
+      });
+    }
+
+    const compactTurns = turns.slice(0, 12).map((t, idx) => ({
+      turn: idx + 1,
+      question: t.question || "",
+      answer: t.answerTranscript || t.transcript || "",
+      overallScore: t.scoreData?.ai?.overallScore ?? t.score ?? null,
+      categoryScores: t.scoreData?.ai?.categoryScores ?? null,
+      strengths: t.scoreData?.ai?.strengths ?? null,
+      improvements: t.scoreData?.ai?.improvements ?? null,
+    }));
+
+    const styleGuidance =
+      style === "friendly"
+        ? "Tone: warm, encouraging, conversational."
+        : style === "serious"
+        ? "Tone: professional, selective, concise, and probing."
+        : "Tone: balanced—supportive but realistic, with follow-ups that get more challenging over time.";
+
+    const prompt = `
+You are an expert college interview coach. Generate a final session report that finds patterns across all turns.
+
+${styleGuidance}
+Difficulty: ${difficulty}
+
+Requirements:
+- Be specific and actionable (not generic).
+- Identify recurring strengths/weaknesses across multiple answers.
+- Provide a practical improvement plan the student can follow.
+- Use the turns data below.
+
+Turns JSON:
+${JSON.stringify(compactTurns, null, 2)}
+
+Return ONLY valid JSON matching the schema.
+`.trim();
+
+    const response = await openai.responses.create({
+      model: "gpt-4o-mini",
+      input: prompt,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "FinalReport",
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              overallAssessment: { type: "string" },
+              topStrengths: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 7 },
+              topWeaknesses: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 7 },
+              improvementPlan: { type: "array", items: { type: "string" }, minItems: 4, maxItems: 10 },
+              standoutMoments: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 6 },
+              nextPracticeQuestions: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 8 },
+            },
+            required: [
+              "overallAssessment",
+              "topStrengths",
+              "topWeaknesses",
+              "improvementPlan",
+              "standoutMoments",
+              "nextPracticeQuestions",
+            ],
+          },
+        },
+      },
+    });
+
+    const report = JSON.parse(response.output_text || "{}");
+    res.json({ ok: true, report });
+  } catch (err) {
+    console.error("Error in /final-report:", err);
+    res.status(500).json({ ok: false, error: "Server error in /final-report" });
   }
 });
 
