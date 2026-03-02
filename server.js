@@ -5,12 +5,13 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 
+require("dotenv").config();
+
 const OpenAI = require("openai");
 
 // ---------- App Setup ----------
 const app = express();
 
-// CORS (adjust origin if you want to lock it down)
 app.use(
   cors({
     origin: "*",
@@ -19,7 +20,7 @@ app.use(
   })
 );
 
-// Preflight
+// Preflight (Express 5-safe)
 app.options(/.*/, cors());
 
 // JSON body parsing for non-multipart routes
@@ -45,9 +46,17 @@ const upload = multer({
   limits: { fileSize: 200 * 1024 * 1024 }, // 200MB
 });
 
+// ---------- Helpers ----------
+function safeUploadPath(filename) {
+  // Disallow path traversal and weird inputs
+  if (!filename || typeof filename !== "string") return null;
+  if (filename.includes("..") || filename.includes("/") || filename.includes("\\")) return null;
+  return path.join(uploadDir, filename);
+}
+
 // ---------- Routes ----------
 app.get("/version", (req, res) => {
-  res.json({ ok: true, version: "phase1-upload-v1" });
+  res.json({ ok: true, version: "phase2-transcribe-v1" });
 });
 
 app.post("/ask", async (req, res) => {
@@ -63,7 +72,6 @@ app.post("/ask", async (req, res) => {
       input: userMessage,
     });
 
-    // Safely extract text output
     const reply =
       response.output_text ||
       (response.output?.[0]?.content?.[0]?.text ?? "No response text returned.");
@@ -92,6 +100,41 @@ app.post("/upload", upload.single("video"), (req, res) => {
   } catch (err) {
     console.error("Error in /upload:", err);
     res.status(500).json({ ok: false, error: "Server error in /upload" });
+  }
+});
+
+/**
+ * Transcribe endpoint:
+ * Body: { filename: "12345-interview.webm" }
+ * Returns: { ok: true, text: "..." }
+ */
+app.post("/transcribe", async (req, res) => {
+  try {
+    const filename = req.body?.filename;
+    const filePath = safeUploadPath(filename);
+
+    if (!filePath) {
+      return res.status(400).json({ ok: false, error: "Invalid filename" });
+    }
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ ok: false, error: "File not found" });
+    }
+
+    // Whisper can transcribe webm directly (no ffmpeg needed)
+    const transcript = await openai.audio.transcriptions.create({
+      model: "whisper-1",
+      file: fs.createReadStream(filePath),
+      // Optional:
+      // response_format: "json",
+      // language: "en",
+    });
+
+    // The SDK returns an object with .text
+    res.json({ ok: true, text: transcript.text, filename });
+  } catch (err) {
+    console.error("Error in /transcribe:", err);
+    res.status(500).json({ ok: false, error: "Server error in /transcribe" });
   }
 });
 
