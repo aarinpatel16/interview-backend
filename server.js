@@ -141,7 +141,7 @@ function computeMetrics(transcript) {
 
 // ---------- Routes ----------
 app.get("/version", (req, res) => {
-  res.json({ ok: true, version: "phase3-score-v1" });
+  res.json({ ok: true, version: "phase4-live-interview-v1" });
 });
 
 app.post("/ask", async (req, res) => {
@@ -287,6 +287,69 @@ Transcript:
   } catch (err) {
     console.error("Error in /score:", err);
     res.status(500).json({ ok: false, error: "Server error in /score" });
+  }
+});
+
+// Next question endpoint: { turns, style, difficulty }
+app.post("/next-question", async (req, res) => {
+  try {
+    const turns = Array.isArray(req.body?.turns) ? req.body.turns : [];
+    const difficulty = req.body?.difficulty || "medium"; // easy | medium | hard
+    const style = req.body?.style || "mixed"; // friendly | serious | mixed
+
+    const styleGuidance =
+      style === "friendly"
+        ? "Tone: warm, encouraging, conversational. Ask supportive follow-ups."
+        : style === "serious"
+        ? "Tone: professional, selective, concise. Ask probing follow-ups and push for specifics."
+        : "Tone: start warm, then gradually become more challenging and selective as the interview progresses.";
+
+    const history = turns
+      .slice(-6)
+      .map((t, i) => `Q${i + 1}: ${t.question}\nA${i + 1}: ${t.answerTranscript}`)
+      .join("\n\n");
+
+    const prompt = `
+You are a realistic college admissions interviewer.
+
+${styleGuidance}
+Difficulty: ${difficulty}
+
+Rules:
+- Ask ONE question only.
+- If no history, start with a warm opener.
+- If there is history, ask a follow-up based on the MOST RECENT answer.
+- Avoid robotic phrasing; make it feel like a real interview.
+
+Conversation so far:
+${history || "(none)"}
+
+Return ONLY valid JSON:
+{ "question": "..." }
+`.trim();
+
+    const response = await openai.responses.create({
+      model: "gpt-4o-mini",
+      input: prompt,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "NextQuestion",
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            properties: { question: { type: "string" } },
+            required: ["question"],
+          },
+        },
+      },
+    });
+
+    const data = JSON.parse(response.output_text || "{}");
+    res.json({ ok: true, question: data.question });
+  } catch (err) {
+    console.error("Error in /next-question:", err);
+    res.status(500).json({ ok: false, error: "Server error in /next-question" });
   }
 });
 
