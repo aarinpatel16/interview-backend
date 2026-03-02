@@ -1,461 +1,328 @@
-// server.js
-const express = require("express");
-const cors = require("cors");
-const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
+// server.js (CommonJS) — Full working example with Coaching Intelligence
 
 require("dotenv").config();
 
+const express = require("express");
+const cors = require("cors");
+const path = require("path");
+const fs = require("fs");
+const multer = require("multer");
+
 const OpenAI = require("openai");
 
-// ---------- App Setup ----------
+// ✅ Step 2 import (make sure you created utils/coaching.js)
+const { analyzeTranscript, aggregateCoaching } = require("./utils/coaching");
+
 const app = express();
+app.use(cors());
+app.use(express.json({ limit: "25mb" }));
 
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
-
-// Preflight (Express 5-safe)
-app.options(/.*/, cors());
-
-// JSON body parsing for non-multipart routes
-app.use(express.json({ limit: "2mb" }));
-
-// ---------- OpenAI ----------
+// --- OpenAI client ---
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ---------- Uploads (Multer) ----------
-const uploadDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+// --- Upload storage ---
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const safeName = Date.now() + "-" + String(file.originalname || "interview.webm").replace(/\s+/g, "_");
-    cb(null, safeName);
+  destination: function (req, file, cb) {
+    cb(null, UPLOAD_DIR);
+  },
+  filename: function (req, file, cb) {
+    const ext = path.extname(file.originalname || ".webm") || ".webm";
+    const safe = `video_${Date.now()}_${Math.random().toString(16).slice(2)}${ext}`;
+    cb(null, safe);
   },
 });
+const upload = multer({ storage });
 
-const upload = multer({
-  storage,
-  limits: { fileSize: 200 * 1024 * 1024 }, // 200MB
-});
-
-// ---------- Helpers ----------
-function safeUploadPath(filename) {
-  if (!filename || typeof filename !== "string") return null;
-  if (filename.includes("..") || filename.includes("/") || filename.includes("\\")) return null;
-  return path.join(uploadDir, filename);
+// --- Helpers ---
+function safeJsonParse(maybeJson, fallback = null) {
+  try {
+    if (!maybeJson) return fallback;
+    if (typeof maybeJson === "object") return maybeJson;
+    return JSON.parse(maybeJson);
+  } catch {
+    return fallback;
+  }
 }
 
-function normalizeText(s) {
-  return (s || "").replace(/\s+/g, " ").trim();
+function interviewerSystemPrompt(style, difficulty) {
+  const stylePrompt =
+    style === "Friendly Alumni"
+      ? "You are a warm, encouraging college alumni conducting a mock interview."
+      : style === "Formal Admissions Officer"
+      ? "You are a formal, professional admissions officer conducting a mock interview."
+      : style === "High-Pressure Interviewer"
+      ? "You are a challenging, high-pressure interviewer. Push for specifics and follow-ups."
+      : "You are a college interviewer conducting a mock interview.";
+
+  const diffPrompt =
+    difficulty === "Easy"
+      ? "Ask accessible questions suitable for a beginner."
+      : difficulty === "Hard"
+      ? "Ask advanced questions and follow-ups that demand specificity and reflection."
+      : "Ask medium-difficulty questions with reasonable depth.";
+
+  return `${stylePrompt}\n${diffPrompt}\nKeep questions concise and realistic. Ask ONE question at a time.`;
 }
 
-function countWords(text) {
-  const t = normalizeText(text);
-  if (!t) return 0;
-  return t.split(" ").filter(Boolean).length;
-}
+async function askNextQuestion({ turns, interviewer_style, difficulty }) {
+  const system = interviewerSystemPrompt(interviewer_style, difficulty);
 
-function countFillerWords(text) {
-  const t = (text || "").toLowerCase();
-
-  const fillers = [
-    "um",
-    "uh",
-    "like",
-    "you know",
-    "kind of",
-    "sort of",
-    "actually",
-    "basically",
-    "literally",
-    "i mean",
-    "right",
+  const messages = [
+    { role: "system", content: system },
+    {
+      role: "user",
+      content:
+        "You are conducting a multi-turn college interview. Ask the next best question based on the conversation so far.",
+    },
   ];
 
-  const counts = {};
-  let total = 0;
-
-  for (const f of fillers) {
-    const re = new RegExp(`\\b${f.replace(/\s+/g, "\\s+")}\\b`, "g");
-    const m = t.match(re);
-    const c = m ? m.length : 0;
-    counts[f] = c;
-    total += c;
+  // Feed prior Q/A to the model
+  for (const t of turns || []) {
+    if (t?.question) messages.push({ role: "assistant", content: `Question: ${t.question}` });
+    if (t?.transcript) messages.push({ role: "user", content: `Answer: ${t.transcript}` });
   }
 
-  return { total, counts };
+  const resp = await openai.chat.completions.create({
+    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+    temperature: 0.7,
+    messages,
+  });
+
+  return resp.choices?.[0]?.message?.content?.trim() || "Tell me about yourself.";
 }
 
-function sentenceStats(text) {
-  const t = normalizeText(text);
-  if (!t) return { sentences: 0, avgWordsPerSentence: 0 };
+async function scoreWithAI({ transcript, question }) {
+  // Returns structured scoring JSON
+  const system =
+    "You are an admissions interview coach. Score answers fairly. Return ONLY valid JSON.";
 
-  const sentences = t
-    .split(/(?<=[.!?])\s+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const user = `
+Question:
+${question || ""}
 
-  if (sentences.length === 0) return { sentences: 0, avgWordsPerSentence: 0 };
+Answer transcript:
+${transcript || ""}
 
-  const wordsPerSentence = sentences.map((s) => countWords(s));
-  const avgWordsPerSentence =
-    wordsPerSentence.reduce((a, b) => a + b, 0) / sentences.length;
+Return JSON with keys:
+overall_score (0-10 number),
+strengths (array of strings),
+improvements (array of strings),
+suggested_better_answer (string, concise),
+rubric (object with: clarity, specificity, reflection, structure each 0-10).
+`;
 
-  return {
-    sentences: sentences.length,
-    avgWordsPerSentence: Math.round(avgWordsPerSentence * 10) / 10,
-  };
+  const resp = await openai.chat.completions.create({
+    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+    temperature: 0.3,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  });
+
+  const text = resp.choices?.[0]?.message?.content || "";
+  const parsed = safeJsonParse(text, null);
+
+  // Fallback if model returns non-JSON
+  if (!parsed) {
+    return {
+      overall_score: 6,
+      strengths: ["Clear attempt to answer the question."],
+      improvements: ["Add more concrete details and outcomes."],
+      suggested_better_answer: "Try adding specific examples and measurable impact.",
+      rubric: { clarity: 6, specificity: 5, reflection: 6, structure: 6 },
+      _raw: text,
+    };
+  }
+
+  return parsed;
 }
 
-function computeMetrics(transcript) {
-  const words = countWords(transcript);
-  const filler = countFillerWords(transcript);
-  const s = sentenceStats(transcript);
+async function buildFinalReportWithAI({ turns, interviewer_style, difficulty }) {
+  const system =
+    "You are an admissions interview coach. Produce a final report. Return ONLY valid JSON.";
 
-  const hasStructureSignals = /first|second|third|overall|in conclusion|to summarize|because|for example/i.test(
-    transcript || ""
-  );
+  const compactTurns = (turns || []).map((t, i) => ({
+    index: i + 1,
+    question: t.question,
+    transcript: t.transcript,
+    overall_score: t?.score?.overall_score ?? t?.overall_score ?? null,
+    coaching: t?.coaching ?? null,
+  }));
 
-  const questionHandlingSignals = /that's a great question|i would say|in my experience|one example/i.test(
-    transcript || ""
-  );
+  const user = `
+Interviewer style: ${interviewer_style || ""}
+Difficulty: ${difficulty || ""}
 
-  return {
-    words,
-    sentences: s.sentences,
-    avgWordsPerSentence: s.avgWordsPerSentence,
-    fillerTotal: filler.total,
-    fillerBreakdown: filler.counts,
-    structureSignals: hasStructureSignals,
-    responseSignals: questionHandlingSignals,
-  };
-}
-
-// ---------- Routes ----------
-app.get("/version", (req, res) => {
-  res.json({ ok: true, version: "phase4-live-interview-v2-final-report" });
-});
-
-app.post("/ask", async (req, res) => {
-  try {
-    const userMessage = req.body?.message || req.body?.input || req.body?.userMessage;
-    if (!userMessage) return res.status(400).json({ error: "Missing message in request body" });
-
-    const response = await openai.responses.create({
-      model: "gpt-4o-mini",
-      input: userMessage,
-    });
-
-    const reply =
-      response.output_text ||
-      response.output?.[0]?.content?.[0]?.text ||
-      "No response text returned.";
-
-    res.json({ reply });
-  } catch (err) {
-    console.error("Error in /ask:", err);
-    res.status(500).json({ error: "Server error in /ask" });
-  }
-});
-
-// Upload endpoint: multipart/form-data with field name "video"
-app.post("/upload", upload.single("video"), (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ ok: false, error: "No file uploaded" });
-
-    res.json({
-      ok: true,
-      filename: req.file.filename,
-      originalname: req.file.originalname,
-      mimetype: req.file.mimetype,
-      size: req.file.size,
-    });
-  } catch (err) {
-    console.error("Error in /upload:", err);
-    res.status(500).json({ ok: false, error: "Server error in /upload" });
-  }
-});
-
-// Transcribe endpoint: { filename }
-app.post("/transcribe", async (req, res) => {
-  try {
-    const filename = req.body?.filename;
-    const filePath = safeUploadPath(filename);
-
-    if (!filePath) return res.status(400).json({ ok: false, error: "Invalid filename" });
-    if (!fs.existsSync(filePath)) return res.status(404).json({ ok: false, error: "File not found" });
-
-    const transcript = await openai.audio.transcriptions.create({
-      model: "whisper-1",
-      file: fs.createReadStream(filePath),
-    });
-
-    res.json({ ok: true, text: transcript.text, filename });
-  } catch (err) {
-    console.error("Error in /transcribe:", err);
-    const message = err?.message || "Unknown error";
-    const status = err?.status || err?.response?.status;
-    const details = err?.response?.data || err?.error || null;
-
-    res.status(500).json({
-      ok: false,
-      error: "Server error in /transcribe",
-      message,
-      status,
-      details,
-    });
-  }
-});
-
-// Score endpoint: { transcript, role?, level? }
-app.post("/score", async (req, res) => {
-  try {
-    const transcriptRaw = req.body?.transcript;
-    const role = req.body?.role || "college admissions interview";
-    const level = req.body?.level || "high school applicant";
-
-    const transcript = normalizeText(transcriptRaw);
-    if (!transcript) return res.status(400).json({ ok: false, error: "Missing transcript" });
-
-    const metrics = computeMetrics(transcript);
-
-    const prompt = `
-You are an interview coach scoring a response for: ${role}.
-Candidate level: ${level}.
-
-Score this transcript using a rubric with clear, actionable feedback.
-Return ONLY valid JSON matching the schema.
-
-Transcript:
-"""${transcript}"""
-`.trim();
-
-    const response = await openai.responses.create({
-      model: "gpt-4o-mini",
-      input: prompt,
-      text: {
-        format: {
-          type: "json_schema",
-          name: "InterviewScore",
-          schema: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              overallScore: { type: "integer", minimum: 1, maximum: 10 },
-              categoryScores: {
-                type: "object",
-                additionalProperties: false,
-                properties: {
-                  content: { type: "integer", minimum: 1, maximum: 10 },
-                  structure: { type: "integer", minimum: 1, maximum: 10 },
-                  clarity: { type: "integer", minimum: 1, maximum: 10 },
-                  confidence: { type: "integer", minimum: 1, maximum: 10 },
-                },
-                required: ["content", "structure", "clarity", "confidence"],
-              },
-              strengths: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 6 },
-              improvements: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 8 },
-              rewriteSuggestion: { type: "string" },
-              followUpQuestions: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 6 },
-            },
-            required: [
-              "overallScore",
-              "categoryScores",
-              "strengths",
-              "improvements",
-              "rewriteSuggestion",
-              "followUpQuestions",
-            ],
-          },
-        },
-      },
-    });
-
-    let ai;
-    try {
-      ai = JSON.parse(response.output_text || "{}");
-    } catch {
-      ai = null;
-    }
-
-    if (!ai) {
-      return res.status(500).json({ ok: false, error: "AI returned invalid JSON" });
-    }
-
-    res.json({ ok: true, metrics, ai });
-  } catch (err) {
-    console.error("Error in /score:", err);
-    res.status(500).json({ ok: false, error: "Server error in /score" });
-  }
-});
-
-// Next question endpoint: { turns, style, difficulty }
-app.post("/next-question", async (req, res) => {
-  try {
-    const turns = Array.isArray(req.body?.turns) ? req.body.turns : [];
-    const difficulty = req.body?.difficulty || "medium"; // easy | medium | hard
-    const style = req.body?.style || "mixed"; // friendly | serious | mixed
-
-    const styleGuidance =
-      style === "friendly"
-        ? "Tone: warm, encouraging, conversational. Ask supportive follow-ups."
-        : style === "serious"
-        ? "Tone: professional, selective, concise. Ask probing follow-ups and push for specifics."
-        : "Tone: start warm, then gradually become more challenging and selective as the interview progresses.";
-
-    const history = turns
-      .slice(-6)
-      .map((t, i) => `Q${i + 1}: ${t.question}\nA${i + 1}: ${t.answerTranscript}`)
-      .join("\n\n");
-
-    const prompt = `
-You are a realistic college admissions interviewer.
-
-${styleGuidance}
-Difficulty: ${difficulty}
-
-Rules:
-- Ask ONE question only.
-- If no history, start with a warm opener.
-- If there is history, ask a follow-up based on the MOST RECENT answer.
-- Avoid robotic phrasing; make it feel like a real interview.
-
-Conversation so far:
-${history || "(none)"}
-
-Return ONLY valid JSON:
-{ "question": "..." }
-`.trim();
-
-    const response = await openai.responses.create({
-      model: "gpt-4o-mini",
-      input: prompt,
-      text: {
-        format: {
-          type: "json_schema",
-          name: "NextQuestion",
-          schema: {
-            type: "object",
-            additionalProperties: false,
-            properties: { question: { type: "string" } },
-            required: ["question"],
-          },
-        },
-      },
-    });
-
-    const data = JSON.parse(response.output_text || "{}");
-    res.json({ ok: true, question: data.question });
-  } catch (err) {
-    console.error("Error in /next-question:", err);
-    res.status(500).json({ ok: false, error: "Server error in /next-question" });
-  }
-});
-
-// ✅ Final report endpoint: { turns, style, difficulty }
-app.post("/final-report", async (req, res) => {
-  try {
-    const turns = Array.isArray(req.body?.turns) ? req.body.turns : [];
-    const style = req.body?.style || "mixed";
-    const difficulty = req.body?.difficulty || "medium";
-
-    if (turns.length === 0) {
-      return res.json({
-        ok: true,
-        report: {
-          overallAssessment:
-            "No answers were recorded in this session, so there isn’t enough information to generate a final report yet.",
-          topStrengths: [],
-          topWeaknesses: [],
-          improvementPlan: [],
-          standoutMoments: [],
-          nextPracticeQuestions: [],
-        },
-      });
-    }
-
-    const compactTurns = turns.slice(0, 12).map((t, idx) => ({
-      turn: idx + 1,
-      question: t.question || "",
-      answer: t.answerTranscript || t.transcript || "",
-      overallScore: t.scoreData?.ai?.overallScore ?? t.score ?? null,
-      categoryScores: t.scoreData?.ai?.categoryScores ?? null,
-      strengths: t.scoreData?.ai?.strengths ?? null,
-      improvements: t.scoreData?.ai?.improvements ?? null,
-    }));
-
-    const styleGuidance =
-      style === "friendly"
-        ? "Tone: warm, encouraging, conversational."
-        : style === "serious"
-        ? "Tone: professional, selective, concise, and probing."
-        : "Tone: balanced—supportive but realistic, with follow-ups that get more challenging over time.";
-
-    const prompt = `
-You are an expert college interview coach. Generate a final session report that finds patterns across all turns.
-
-${styleGuidance}
-Difficulty: ${difficulty}
-
-Requirements:
-- Be specific and actionable (not generic).
-- Identify recurring strengths/weaknesses across multiple answers.
-- Provide a practical improvement plan the student can follow.
-- Use the turns data below.
-
-Turns JSON:
+Turns:
 ${JSON.stringify(compactTurns, null, 2)}
 
-Return ONLY valid JSON matching the schema.
-`.trim();
+Return JSON with keys:
+summary (string),
+overall_strengths (array of strings),
+overall_improvements (array of strings),
+avg_overall_score (number),
+notable_moments (array of strings),
+action_plan (array of strings).
+`;
 
-    const response = await openai.responses.create({
-      model: "gpt-4o-mini",
-      input: prompt,
-      text: {
-        format: {
-          type: "json_schema",
-          name: "FinalReport",
-          schema: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              overallAssessment: { type: "string" },
-              topStrengths: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 7 },
-              topWeaknesses: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 7 },
-              improvementPlan: { type: "array", items: { type: "string" }, minItems: 4, maxItems: 10 },
-              standoutMoments: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 6 },
-              nextPracticeQuestions: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 8 },
-            },
-            required: [
-              "overallAssessment",
-              "topStrengths",
-              "topWeaknesses",
-              "improvementPlan",
-              "standoutMoments",
-              "nextPracticeQuestions",
-            ],
-          },
-        },
-      },
+  const resp = await openai.chat.completions.create({
+    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+    temperature: 0.3,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  });
+
+  const text = resp.choices?.[0]?.message?.content || "";
+  const parsed = safeJsonParse(text, null);
+
+  if (!parsed) {
+    return {
+      summary: "Interview completed. Review feedback per question and focus on specifics and outcomes.",
+      overall_strengths: ["You stayed engaged and answered each prompt."],
+      overall_improvements: ["Add more concrete examples and measurable impact."],
+      avg_overall_score: null,
+      notable_moments: [],
+      action_plan: ["Practice STAR structure for behavioral questions."],
+      _raw: text,
+    };
+  }
+
+  return parsed;
+}
+
+// --- Routes ---
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
+});
+
+// Start interview: first question
+app.post("/ask", async (req, res) => {
+  try {
+    const { interviewer_style, difficulty } = req.body;
+    const firstQuestion = await askNextQuestion({
+      turns: [],
+      interviewer_style,
+      difficulty,
     });
 
-    const report = JSON.parse(response.output_text || "{}");
-    res.json({ ok: true, report });
+    res.json({ question: firstQuestion });
   } catch (err) {
-    console.error("Error in /final-report:", err);
-    res.status(500).json({ ok: false, error: "Server error in /final-report" });
+    console.error("/ask error:", err);
+    res.status(500).json({ error: "Failed to generate question" });
   }
 });
 
-// ---------- Start Server ----------
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Next question after a turn
+app.post("/next-question", async (req, res) => {
+  try {
+    const { turns, interviewer_style, difficulty } = req.body;
+    const next = await askNextQuestion({ turns, interviewer_style, difficulty });
+    res.json({ question: next });
+  } catch (err) {
+    console.error("/next-question error:", err);
+    res.status(500).json({ error: "Failed to generate next question" });
+  }
+});
+
+// Upload video blob -> filename
+app.post("/upload", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file?.filename) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+    res.json({ filename: req.file.filename });
+  } catch (err) {
+    console.error("/upload error:", err);
+    res.status(500).json({ error: "Upload failed" });
+  }
+});
+
+// Transcribe a previously uploaded file
+app.post("/transcribe", async (req, res) => {
+  try {
+    const { filename } = req.body;
+    if (!filename) return res.status(400).json({ error: "filename required" });
+
+    const filePath = path.join(UPLOAD_DIR, filename);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: "File not found" });
+    }
+
+    const transcriptResp = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(filePath),
+      model: process.env.WHISPER_MODEL || "whisper-1",
+    });
+
+    const transcript = transcriptResp.text || "";
+    res.json({ transcript });
+  } catch (err) {
+    console.error("/transcribe error:", err);
+    res.status(500).json({ error: "Transcription failed" });
+  }
+});
+
+// ✅ Score transcript with AI + Coaching Intelligence
+app.post("/score", async (req, res) => {
+  try {
+    const { transcript, question, durationSeconds } = req.body;
+
+    if (!transcript) return res.status(400).json({ error: "transcript required" });
+
+    // Existing AI scoring
+    const aiScore = await scoreWithAI({ transcript, question });
+
+    // ✅ Coaching Intelligence (Step 2)
+    const coaching = analyzeTranscript({
+      transcript,
+      question,
+      durationSeconds: Number(durationSeconds || 0),
+    });
+
+    res.json({
+      ...aiScore,
+      coaching,
+    });
+  } catch (err) {
+    console.error("/score error:", err);
+    res.status(500).json({ error: "Scoring failed" });
+  }
+});
+
+// ✅ Final report + Coaching Summary
+app.post("/final-report", async (req, res) => {
+  try {
+    const { turns, interviewer_style, difficulty } = req.body;
+    if (!Array.isArray(turns)) return res.status(400).json({ error: "turns array required" });
+
+    // Existing final report (AI)
+    const finalReport = await buildFinalReportWithAI({
+      turns,
+      interviewer_style,
+      difficulty,
+    });
+
+    // ✅ Coaching summary (Step 2)
+    const coaching_summary = aggregateCoaching(turns);
+
+    res.json({
+      ...finalReport,
+      coaching_summary,
+    });
+  } catch (err) {
+    console.error("/final-report error:", err);
+    res.status(500).json({ error: "Final report failed" });
+  }
+});
+
+// --- Start server ---
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
