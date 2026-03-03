@@ -1,6 +1,7 @@
-// utils/coaching.js
+// utils/coaching.js (v2)
+
 function normalize(text = "") {
-  return text
+  return String(text)
     .replace(/\s+/g, " ")
     .replace(/[“”]/g, '"')
     .replace(/[‘’]/g, "'")
@@ -14,10 +15,10 @@ function countWords(text = "") {
 }
 
 function countOccurrences(text, phrase) {
-  // phrase can contain spaces; count overlapping minimally by scanning
   const hay = normalize(text).toLowerCase();
-  const needle = phrase.toLowerCase();
+  const needle = String(phrase || "").toLowerCase();
   if (!needle) return 0;
+
   let count = 0;
   let idx = 0;
   while (true) {
@@ -43,7 +44,7 @@ function sentenceStats(text = "") {
   const total = sentenceWordCounts.reduce((a, b) => a + b, 0);
   const avg = sentences ? total / sentences : 0;
 
-  // “Long” = 25+ words (readability penalty)
+  // long sentence = 25+ words
   const longCount = sentenceWordCounts.filter((n) => n >= 25).length;
   const longRatio = sentences ? longCount / sentences : 0;
 
@@ -51,7 +52,7 @@ function sentenceStats(text = "") {
 }
 
 function detectBehavioral(question = "") {
-  const q = (question || "").toLowerCase();
+  const q = String(question || "").toLowerCase();
   const cues = [
     "tell me about a time",
     "describe a time",
@@ -60,6 +61,7 @@ function detectBehavioral(question = "") {
     "challenge",
     "conflict",
     "lead",
+    "leadership",
     "failure",
     "overcame",
     "mistake",
@@ -72,18 +74,81 @@ function detectBehavioral(question = "") {
 function starCoverage(text = "") {
   const t = normalize(text).toLowerCase();
 
-  // Heuristic cues for each STAR piece (simple + robust enough for v1)
-  const S = /when|at the time|in (my|our)|during|i was (in|at)|we were/.test(t);
+  const S = /when|at the time|during|in (my|our)|we were|i was (in|at)/.test(t);
   const T = /my goal|i needed to|we needed to|task was|responsible for|objective/.test(t);
   const A = /i did|i decided|i worked|i led|i created|i implemented|i organized|i built|i learned|i asked/.test(t);
-  const R = /result|as a result|we achieved|i achieved|impact|improved|increased|decreased|learned that|led to/.test(t);
+  const R = /result|as a result|we achieved|i achieved|impact|improved|increased|decreased|led to|learned that/.test(t);
 
   const score = Math.round(((+S + +T + +A + +R) / 4) * 100);
-  return { coverage: { S, T, A, R }, score };
+
+  const missing = [];
+  if (!S) missing.push("Situation");
+  if (!T) missing.push("Task");
+  if (!A) missing.push("Action");
+  if (!R) missing.push("Result");
+
+  return { coverage: { S, T, A, R }, score, missing };
 }
 
-function admissionsReadinessScore({ wpm, fillerPerMin, hedgeCount, starScore, longSentenceRatio }) {
-  // Start at 100 and subtract penalties (then clamp)
+function quantifySignals(text = "") {
+  const t = normalize(text);
+
+  // numbers like 10, 10%, 3.5, $200, 2x
+  const numberMatches = t.match(/\b(\$?\d+(\.\d+)?%?|\d+x)\b/g) || [];
+  const numberCount = numberMatches.length;
+
+  const metricWords = [
+    "percent",
+    "%",
+    "increase",
+    "decrease",
+    "improved",
+    "reduced",
+    "grew",
+    "growth",
+    "impact",
+    "results",
+    "metric",
+    "kpi",
+    "conversion",
+    "retention",
+    "revenue",
+    "users",
+    "views",
+    "hours",
+    "minutes",
+    "days",
+    "weeks",
+    "months",
+  ];
+  const metricWordHits = metricWords.filter((w) => countOccurrences(t, w) > 0);
+
+  // a simple “impact” score
+  const score = Math.min(100, numberCount * 18 + metricWordHits.length * 8);
+
+  return {
+    number_count: numberCount,
+    metric_word_hits: metricWordHits.slice(0, 6),
+    score,
+  };
+}
+
+function confidenceScore({ fillerPerMin, hedgeCount }) {
+  // 0–100 (higher = more confident delivery language)
+  let score = 100;
+
+  if (fillerPerMin > 10) score -= 22;
+  else if (fillerPerMin > 7) score -= 14;
+  else if (fillerPerMin > 4) score -= 8;
+
+  if (hedgeCount >= 6) score -= 16;
+  else if (hedgeCount >= 3) score -= 10;
+  else if (hedgeCount >= 1) score -= 4;
+
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+function admissionsReadinessScore({ wpm, fillerPerMin, hedgeCount, starScore, longSentenceRatio, impactScore }) {
   let score = 100;
 
   // WPM target: 130–170 ideal
@@ -93,62 +158,75 @@ function admissionsReadinessScore({ wpm, fillerPerMin, hedgeCount, starScore, lo
   else if (wpm <= 190) score -= 6;
   else score -= 12;
 
-  // Filler density penalty
+  // filler density
   if (fillerPerMin > 10) score -= 18;
   else if (fillerPerMin > 7) score -= 12;
   else if (fillerPerMin > 4) score -= 6;
 
-  // Hedging penalty
+  // hedging
   if (hedgeCount >= 6) score -= 10;
   else if (hedgeCount >= 3) score -= 6;
   else if (hedgeCount >= 1) score -= 2;
 
-  // STAR bonus/penalty (mostly impacts behavioral answers)
+  // STAR (behavioral only)
   if (typeof starScore === "number") {
     if (starScore >= 75) score += 4;
     else if (starScore >= 50) score += 0;
     else score -= 6;
   }
 
-  // Clarity penalty: too many long sentences
+  // clarity
   if (longSentenceRatio > 0.25) score -= 8;
   else if (longSentenceRatio > 0.15) score -= 4;
 
-  score = Math.max(0, Math.min(100, Math.round(score)));
-  return score;
+  // impact (numbers / metrics)
+  if (typeof impactScore === "number") {
+    if (impactScore >= 40) score += 4;
+    else if (impactScore >= 20) score += 2;
+  }
+
+  return Math.max(0, Math.min(100, Math.round(score)));
 }
 
-function buildFeedback({ wpm, filler, hedging, star, isBehavioral }) {
+function buildFeedback({ wpm, filler, hedging, star, isBehavioral, impact, confidence }) {
   const bullets = [];
 
-  // WPM
-  if (wpm < 110) bullets.push(`Speaking pace was slow (${wpm} WPM). Aim for ~130–170 WPM.`);
-  else if (wpm > 190) bullets.push(`Speaking pace was rushed (${wpm} WPM). Slow down slightly for clarity.`);
-  else bullets.push(`Good speaking pace (${wpm} WPM).`);
+  // pace
+  if (wpm < 110) bullets.push(`Pace was slow (${wpm} WPM). Aim for ~130–170 WPM.`);
+  else if (wpm > 190) bullets.push(`Pace was rushed (${wpm} WPM). Slow slightly for clarity.`);
+  else bullets.push(`Good pace (${wpm} WPM).`);
 
-  // Filler
-  if (filler.per_min > 7) bullets.push(`Filler words were noticeable (${filler.count}; ~${filler.per_min}/min). Try pausing instead.`);
-  else if (filler.per_min > 4) bullets.push(`Some filler words (${filler.count}; ~${filler.per_min}/min). Reduce a bit for polish.`);
-  else bullets.push(`Low filler usage (${filler.count}; ~${filler.per_min}/min).`);
+  // filler
+  if (filler.per_min > 7) bullets.push(`Filler words were noticeable (~${filler.per_min}/min). Replace with pauses.`);
+  else if (filler.per_min > 4) bullets.push(`Some filler (~${filler.per_min}/min). Try trimming a bit.`);
+  else bullets.push(`Low filler usage (~${filler.per_min}/min).`);
 
-  // Hedging
-  if (hedging.count >= 3) bullets.push(`Hedging language appeared (${hedging.count}). Use more direct phrasing for confidence.`);
-  else if (hedging.count >= 1) bullets.push(`Minor hedging (${hedging.count}). Consider slightly firmer phrasing.`);
+  // confidence
+  if (confidence < 70) bullets.push(`Confidence language could be stronger. Reduce hedging and filler.`);
+  else bullets.push(`Confident delivery (confidence ${confidence}/100).`);
+
+  // impact
+  if (impact.score < 20) bullets.push(`Add measurable impact (numbers, outcomes, results).`);
+  else bullets.push(`Nice use of impact signals (impact ${impact.score}/100).`);
 
   // STAR
   if (isBehavioral) {
     if (star.score >= 75) bullets.push(`Strong STAR structure (score ${star.score}).`);
-    else if (star.score >= 50) bullets.push(`Decent STAR structure (score ${star.score}). Add a clearer Task or Result.`);
-    else bullets.push(`STAR structure missing key pieces (score ${star.score}). Include Situation → Task → Action → Result.`);
+    else if (star.score >= 50) bullets.push(`Decent STAR (score ${star.score}). Add: ${star.missing?.[0] || "Task/Result"}.`);
+    else bullets.push(`STAR is missing key parts (score ${star.score}). Include Situation → Task → Action → Result.`);
   }
 
-  return bullets.slice(0, 4);
+  // hedging detail
+  if (hedging.count >= 3) bullets.push(`Hedging appeared (${hedging.count}). Use more direct phrasing.`);
+
+  return bullets.slice(0, 5);
 }
 
 function analyzeTranscript({ transcript, question, durationSeconds }) {
   const text = normalize(transcript || "");
   const words = countWords(text);
-  const minutes = Math.max(0.1, (durationSeconds || 0) / 60); // avoid divide by 0
+
+  const minutes = Math.max(0.1, Number(durationSeconds || 0) / 60); // avoid divide by 0
   const wpm = Math.round(words / minutes);
 
   const fillerPhrases = ["um", "uh", "like", "you know", "basically", "literally", "kind of", "sort of"];
@@ -159,6 +237,7 @@ function analyzeTranscript({ transcript, question, durationSeconds }) {
 
   const fillerCount = fillerCounts.reduce((acc, [, c]) => acc + c, 0);
   const fillerPerMin = Math.round((fillerCount / minutes) * 10) / 10;
+  const fillerPct = words ? Math.round((fillerCount / words) * 1000) / 10 : 0; // % of words
 
   const hedgePhrases = ["i think", "maybe", "i guess", "probably", "kind of", "sort of", "i feel like", "in my opinion"];
   const hedgeHits = hedgePhrases.filter((p) => countOccurrences(text, p) > 0);
@@ -167,7 +246,13 @@ function analyzeTranscript({ transcript, question, durationSeconds }) {
   const stats = sentenceStats(text);
 
   const isBehavioral = detectBehavioral(question);
-  const star = isBehavioral ? starCoverage(text) : { coverage: { S: false, T: false, A: false, R: false }, score: null };
+  const star = isBehavioral
+    ? starCoverage(text)
+    : { coverage: { S: false, T: false, A: false, R: false }, score: null, missing: [] };
+
+  const impact = quantifySignals(text);
+
+  const confidence = confidenceScore({ fillerPerMin, hedgeCount });
 
   const admissions_readiness = admissionsReadinessScore({
     wpm,
@@ -175,30 +260,42 @@ function analyzeTranscript({ transcript, question, durationSeconds }) {
     hedgeCount,
     starScore: star.score,
     longSentenceRatio: stats.long_sentence_ratio,
+    impactScore: impact.score,
   });
 
   const coaching = {
     words,
-    duration_seconds: durationSeconds || 0,
+    duration_seconds: Number(durationSeconds || 0),
     wpm,
+    pacing_band: wpm < 110 ? "slow" : wpm > 190 ? "fast" : "ideal",
+
     filler: {
       count: fillerCount,
       per_min: fillerPerMin,
+      pct_words: fillerPct,
       top: fillerCounts.slice(0, 3),
     },
+
     hedging: {
       count: hedgeCount,
       examples: hedgeHits.slice(0, 3),
     },
+
     star: {
       is_behavioral: isBehavioral,
       coverage: star.coverage,
       score: star.score,
+      missing: star.missing || [],
     },
+
+    impact,
+
     clarity: {
       avg_sentence_words: Math.round(stats.avg_sentence_words * 10) / 10,
       long_sentence_ratio: Math.round(stats.long_sentence_ratio * 100) / 100,
     },
+
+    confidence,
     admissions_readiness,
   };
 
@@ -208,6 +305,8 @@ function analyzeTranscript({ transcript, question, durationSeconds }) {
     hedging: coaching.hedging,
     star: coaching.star,
     isBehavioral,
+    impact,
+    confidence,
   });
 
   return coaching;
@@ -221,14 +320,15 @@ function aggregateCoaching(turns = []) {
 
   const avgWpm = Math.round(avg(valid.map((t) => t.coaching.wpm)));
   const avgFillerPerMin = Math.round(avg(valid.map((t) => t.coaching.filler.per_min)) * 10) / 10;
+  const avgFillerPct = Math.round(avg(valid.map((t) => t.coaching.filler.pct_words)) * 10) / 10;
   const avgReadiness = Math.round(avg(valid.map((t) => t.coaching.admissions_readiness)));
+  const avgConfidence = Math.round(avg(valid.map((t) => t.coaching.confidence)));
+  const avgImpact = Math.round(avg(valid.map((t) => t.coaching.impact.score)));
 
   const behavioral = valid.filter((t) => t.coaching.star.is_behavioral);
-  const avgStar = behavioral.length
-    ? Math.round(avg(behavioral.map((t) => t.coaching.star.score || 0)))
-    : null;
+  const avgStar = behavioral.length ? Math.round(avg(behavioral.map((t) => t.coaching.star.score || 0))) : null;
 
-  // Top filler overall
+  // Top fillers overall
   const fillerMap = new Map();
   for (const t of valid) {
     for (const [phrase, c] of t.coaching.filler.top || []) {
@@ -237,21 +337,24 @@ function aggregateCoaching(turns = []) {
   }
   const topFillers = Array.from(fillerMap.entries()).sort((a, b) => b[1] - a[1]).slice(0, 3);
 
-  // Priorities
   const priorities = [];
   if (avgFillerPerMin > 7) priorities.push("Reduce filler words (replace with pauses).");
   if (avgWpm > 190) priorities.push("Slow pace slightly for clarity.");
   if (avgWpm < 110) priorities.push("Increase pace slightly for energy.");
   if (avgStar !== null && avgStar < 60) priorities.push("Use STAR more consistently for behavioral questions.");
-  if (!priorities.length) priorities.push("Maintain strong delivery; focus on adding sharper outcomes/results.");
+  if (avgImpact < 20) priorities.push("Add measurable outcomes (numbers, results, impact).");
+  if (!priorities.length) priorities.push("Maintain strong delivery; focus on sharper results and specificity.");
 
   return {
     avg_wpm: avgWpm,
     avg_filler_per_min: avgFillerPerMin,
+    avg_filler_pct_words: avgFillerPct,
     avg_star_score_behavioral: avgStar,
+    avg_impact: avgImpact,
+    avg_confidence: avgConfidence,
     admissions_readiness: avgReadiness,
-    top_fillers: topFillers         ,
-    priorities: priorities.slice(0, 3),
+    top_fillers: topFillers,
+    priorities: priorities.slice(0, 4),
   };
 }
 
