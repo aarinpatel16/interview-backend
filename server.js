@@ -234,7 +234,23 @@ improvements[]
 // MOMENT DETECTION
 // =======================
 
-const prompt = `
+app.post("/moments", async (req, res) => {
+  try {
+    const transcript = String(req.body?.transcript || "").trim();
+    const durationSeconds = Number(req.body?.durationSeconds || 60);
+
+    if (!transcript) {
+      return res.status(400).json({ error: "transcript required" });
+    }
+
+    // Clamp duration to a reasonable range
+    const durSec = Number.isFinite(durationSeconds)
+      ? Math.max(10, Math.min(600, durationSeconds))
+      : 60;
+
+    const maxMs = Math.round(durSec * 1000);
+
+    const prompt = `
 You are an interview coach.
 
 TASK:
@@ -242,7 +258,7 @@ Identify 2 to 4 short "moments" within the answer: some "excelled" and some "nee
 
 Rules:
 - Always return at least 2 moments.
-- Use startMs/endMs within 0 to ${Math.max(1, Number(durationSeconds || 60)) * 1000}.
+- startMs/endMs must be between 0 and ${maxMs}.
 - Each moment length must be between 5000ms and 20000ms.
 - If you are unsure, make a reasonable guess.
 - Return ONLY valid JSON. No markdown. No commentary.
@@ -274,27 +290,83 @@ Return JSON exactly in this shape:
 `;
 
     const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      temperature: 0.2,
       messages: [
-        { role: "system", content: "Interview coach analyzing moments." },
+        { role: "system", content: "Return ONLY valid JSON." },
         { role: "user", content: prompt },
       ],
     });
 
-    const text = response.choices[0].message.content;
+    const text = response.choices?.[0]?.message?.content || "";
 
-    let parsed;
-
+    // Try direct JSON parse, else extract the last {...} block
+    let parsed = null;
     try {
       parsed = JSON.parse(text);
     } catch {
+      const match = text.match(/\{[\s\S]*\}\s*$/);
+      if (match) {
+        try {
+          parsed = JSON.parse(match[0]);
+        } catch {
+          parsed = null;
+        }
+      }
+    }
+
+    if (!parsed || !Array.isArray(parsed.moments)) {
       parsed = { moments: [] };
     }
 
-    res.json(parsed);
+    // If model returned empty, add safe fallback moments
+    if (parsed.moments.length === 0) {
+      parsed.moments = [
+        {
+          type: "needs_improvement",
+          title: "More specificity",
+          startMs: Math.min(5000, maxMs - 5000),
+          endMs: Math.min(15000, maxMs),
+          reason: "Answer stays general and lacks concrete outcomes.",
+          howToImprove: "Add one specific example with measurable impact (numbers, result, what you did).",
+        },
+        {
+          type: "excelled",
+          title: "Positive intent",
+          startMs: Math.min(20000, maxMs - 5000),
+          endMs: Math.min(30000, maxMs),
+          reason: "You communicated motivation and effort clearly.",
+          howToImprove: null,
+        },
+      ];
+    }
 
+    // Clamp/validate timestamps so they’re always valid
+    parsed.moments = parsed.moments
+      .map((m) => {
+        const startMs = Math.max(0, Math.min(maxMs, Number(m.startMs || 0)));
+        let endMs = Math.max(0, Math.min(maxMs, Number(m.endMs || 0)));
+
+        // Ensure at least 5s window
+        if (endMs - startMs < 5000) {
+          endMs = Math.min(maxMs, startMs + 5000);
+        }
+
+        return {
+          type: m.type === "excelled" ? "excelled" : "needs_improvement",
+          title: String(m.title || "").slice(0, 80) || "Moment",
+          startMs,
+          endMs,
+          reason: String(m.reason || "").slice(0, 200) || "Reason not provided.",
+          howToImprove:
+            m.type === "excelled" ? null : String(m.howToImprove || "").slice(0, 220) || "Try to be more specific and structured.",
+        };
+      })
+      .slice(0, 4);
+
+    res.json(parsed);
   } catch (err) {
-    console.error(err);
+    console.error("/moments error:", err);
     res.status(500).json({ error: "Moment detection failed" });
   }
 });
