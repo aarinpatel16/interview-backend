@@ -234,30 +234,42 @@ improvements[]
 // MOMENT DETECTION
 // =======================
 
-app.post("/moments", async (req, res) => {
+const prompt = `
+You are an interview coach.
 
-  try {
+TASK:
+Identify 2 to 4 short "moments" within the answer: some "excelled" and some "needs_improvement".
 
-    const { transcript, durationSeconds } = req.body;
-
-    const prompt = `
-Analyze this interview answer and identify moments.
+Rules:
+- Always return at least 2 moments.
+- Use startMs/endMs within 0 to ${Math.max(1, Number(durationSeconds || 60)) * 1000}.
+- Each moment length must be between 5000ms and 20000ms.
+- If you are unsure, make a reasonable guess.
+- Return ONLY valid JSON. No markdown. No commentary.
 
 Transcript:
 ${transcript}
 
-Return JSON:
+Return JSON exactly in this shape:
 {
-moments:[
-{
-type:"excelled",
-startMs:10000,
-endMs:20000,
-title:"Strong example",
-reason:"Clear leadership example",
-howToImprove:null
-}
-]
+  "moments": [
+    {
+      "type": "excelled",
+      "title": "Short title",
+      "startMs": 5000,
+      "endMs": 15000,
+      "reason": "Why it was good",
+      "howToImprove": null
+    },
+    {
+      "type": "needs_improvement",
+      "title": "Short title",
+      "startMs": 20000,
+      "endMs": 30000,
+      "reason": "What went wrong",
+      "howToImprove": "Concrete improvement tip"
+    }
+  ]
 }
 `;
 
